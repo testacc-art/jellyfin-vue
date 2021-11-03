@@ -1,24 +1,22 @@
 <template>
-  <div>
+  <div :class="{ stretch: stretch }">
     <video
       ref="player"
-      :class="{ stretch: stretch }"
       :poster="poster.url"
-      autoplay
       crossorigin="anonymous"
       playsinline
       @timeupdate="onProgressThrottled"
       @pause="onPause"
       @play="onPlay"
       @ended="onStopped"
+      style="width: 100%; height: 100%"
     />
   </div>
 </template>
 
 <script lang="ts">
 import Vue from 'vue';
-// @ts-expect-error No typings in the old version we're using
-import Hls, { ErrorData, Events } from 'hls.js';
+import VideoJs, { VideoJsPlayer } from 'video.js';
 // @ts-expect-error - No types for libass
 import SubtitlesOctopus from 'libass-wasm';
 // @ts-expect-error - No types for libass
@@ -57,7 +55,7 @@ export default Vue.extend({
     return {
       playbackInfo: {} as PlaybackInfoResponse,
       source: '',
-      hls: undefined as Hls | undefined,
+      videojs: undefined as VideoJsPlayer | undefined,
       octopus: undefined as SubtitlesOctopus | undefined,
       // eslint-disable-next-line @typescript-eslint/no-empty-function
       unsubscribe(): void {},
@@ -86,14 +84,6 @@ export default Vue.extend({
     },
     videoElement(): HTMLVideoElement {
       return this.$refs.player as HTMLVideoElement;
-    },
-    isHls() {
-      const mediaSource = this.currentMediaSource as MediaSourceInfo;
-
-      return (
-        mediaSource.SupportsTranscoding &&
-        mediaSource.TranscodingSubProtocol === 'hls'
-      );
     }
   },
   watch: {
@@ -103,32 +93,23 @@ export default Vue.extend({
     source(newSource): void {
       this.destroy();
 
-      const mediaSource = this.currentMediaSource as MediaSourceInfo;
-      const item = this.getCurrentItem as BaseItemDto;
-
-      if (
-        mediaSource.SupportsDirectPlay ||
-        (this.isHls &&
-          this.videoElement.canPlayType('application/vnd.apple.mpegurl'))
-      ) {
-        this.videoElement.src = newSource;
-      } else if (Hls.isSupported() && this.isHls) {
-        this.hls = new Hls();
-        this.hls.on(Hls.Events.ERROR, this.onHlsError);
-        this.hls.attachMedia(this.videoElement);
-        this.hls.loadSource(newSource);
-      } else {
+      if (!this.videojs) {
         this.$nuxt.error({
           message: this.$t('browserNotSupported')
         });
-
         return;
       }
 
-      this.videoElement.currentTime =
+      const item = this.getCurrentItem as BaseItemDto;
+
+      this.videojs.src(newSource);
+
+      const startTime =
         this.restartTime ||
         this.ticksToMs(item.UserData?.PlaybackPositionTicks || 0) / 1000;
-      this.restartTime = undefined;
+      this.videojs.currentTime(startTime);
+
+      this.videojs.play();
 
       this.subtitleTrack = (
         this.getCurrentItemParsedSubtitleTracks as PlaybackTrack[]
@@ -142,33 +123,34 @@ export default Vue.extend({
       }
 
       // Will display (or not) current external subtitle when start of video is loaded
-      this.videoElement.addEventListener('loadeddata', () => {
+      this.videojs.one('loadeddata', () => {
         this.displayExternalSub(this.subtitleTrack);
       });
 
       this.unsubscribe = this.$store.subscribe((mutation, _state: AppState) => {
         switch (mutation.type) {
           case 'playbackManager/PAUSE_PLAYBACK':
-            this.videoElement.pause();
+            this.videojs?.pause();
             break;
           case 'playbackManager/UNPAUSE_PLAYBACK':
-            this.videoElement.play();
+            this.videojs?.play();
             break;
           case 'playbackManager/CHANGE_CURRENT_TIME':
             if (mutation?.payload?.time !== null) {
-              this.videoElement.currentTime = mutation?.payload?.time;
+              this.videojs?.currentTime(mutation?.payload?.time);
             }
 
             break;
           case 'playbackManager/SET_VOLUME':
-            this.videoElement.volume = Math.pow(this.currentVolume / 100, 3);
+            this.videojs?.volume(Math.pow(this.currentVolume / 100, 3));
             break;
+
           case 'playbackManager/SET_CURRENT_SUBTITLE_TRACK_INDEX':
             if (mutation?.payload?.subtitleStreamIndex !== null) {
               this.changeSubtitle(mutation?.payload?.subtitleStreamIndex);
             }
-
             break;
+
           case 'playbackManager/SET_CURRENT_AUDIO_TRACK_INDEX':
             if (mutation?.payload?.audioStreamIndex !== null) {
               // Set the restart time so that the function knows where to restart
@@ -180,12 +162,15 @@ export default Vue.extend({
     }
   },
   mounted() {
-    this.getPlaybackUrl();
+    this.videojs = VideoJs(this.videoElement, undefined, this.getPlaybackUrl);
   },
   beforeDestroy() {
     this.onStopped(); // Report that the playback is stopping
 
     this.destroy();
+    if (this.videojs) {
+      this.videojs.dispose();
+    }
   },
   methods: {
     ...mapActions('playbackManager', [
@@ -284,11 +269,11 @@ export default Vue.extend({
       }
 
       // Disable VTT
-      const oldVtt = this.videoElement.getElementsByTagName('track')[0];
-
-      if (oldVtt) {
-        this.videoElement.textTracks[0].mode = 'disabled';
-        oldVtt.remove();
+      for (let i = 0; i < (this.videojs?.textTracks().length || 0); ++i) {
+        if (this.videojs?.textTracks()[i].kind === 'subtitles') {
+          // @ts-expect-error - Wrong typing but works
+          this.videojs.removeRemoteTextTrack(this.videojs.textTracks()[i]);
+        }
       }
 
       // If new sub doesn't exist, we're done here
@@ -307,15 +292,19 @@ export default Vue.extend({
       ).findIndex((el) => el.srcIndex === newSub.srcIndex);
 
       if (vttIdx !== -1) {
-        // Manually add and remove (when disabling) a <track> tag cause in FF we weren't able to make it reliably work with a v-for and a tracks[index].mode = "showing"
-        const newVtt = document.createElement('track');
-
-        newVtt.kind = 'subtitles';
-        newVtt.srclang = newSub.srcLang || '';
-        newVtt.src = this.$axios.defaults.baseURL + (newSub.src || '');
-        this.videoElement.appendChild(newVtt);
-        this.videoElement.textTracks[0].mode = 'showing';
-        this.subtitleTrack = newSub;
+        const track = this.videojs?.addRemoteTextTrack(
+          { src: this.$axios.defaults.baseURL + (newSub.src || '') },
+          true
+        );
+        if (track) {
+          track.addEventListener('load', () => {
+            for (let i = 0; i < (this.videojs?.textTracks().length || 0); ++i) {
+              if (this.videojs?.textTracks()[i].kind === 'subtitles') {
+                this.videojs.textTracks()[i].mode = 'showing';
+              }
+            }
+          });
+        }
       } else if (assIdx !== -1) {
         if (!this.octopus) {
           this.octopus = new SubtitlesOctopus({
@@ -334,34 +323,7 @@ export default Vue.extend({
         this.subtitleTrack = newSub;
       }
     },
-    onHlsError(_event: Events.ERROR, data: ErrorData): void {
-      if (!this.hls) return;
-
-      if (data.fatal) {
-        switch (data.type) {
-          case Hls.ErrorTypes.NETWORK_ERROR:
-            // try to recover network error
-            this.hls.startLoad();
-            break;
-          case Hls.ErrorTypes.MEDIA_ERROR:
-            this.hls.recoverMediaError();
-            break;
-          default:
-            // cannot recover
-            this.hls.destroy();
-            this.$nuxt.error({
-              message: this.$t('fatalHlsError')
-            });
-            break;
-        }
-      }
-    },
     destroy() {
-      if (this.hls) {
-        this.hls.destroy();
-        this.hls = undefined;
-      }
-
       if (this.octopus) {
         this.octopus.dispose();
         this.octopus = undefined;
@@ -410,15 +372,22 @@ export default Vue.extend({
 });
 </script>
 
+<style>
+@import 'video.js/dist/video-js.min.css';
+
+.vjs-loading-spinner {
+  display: none !important;
+}
+</style>
+
 <style scoped>
-.videoControls,
-video {
+.videoControls {
   max-width: 100vw;
   max-height: 100vh;
-  width: 100%;
 }
 
 .stretch {
   width: 100vw !important;
+  height: 100vh !important;
 }
 </style>
