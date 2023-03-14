@@ -80,14 +80,13 @@ import {
   ImageType
 } from '@jellyfin/sdk/lib/generated-client';
 import { useI18n } from 'vue-i18n';
-import { useMediaQuery } from '@vueuse/core';
 import {
   CardShapes,
   getShapeFromItemType,
   getItemDetailsLink,
   canPlay
 } from '@/utils/items';
-import { taskManagerStore } from '@/store';
+import { taskManagerStore, isFinePointer } from '@/store';
 
 const props = withDefaults(
   defineProps<{
@@ -205,8 +204,6 @@ const getImageType = computed(() =>
 const refreshProgress = computed(
   () => taskManager.getTask(props.item.Id || '')?.progress
 );
-
-const isFinePointer = useMediaQuery('(pointer:fine)');
 </script>
 
 <style lang="scss" scoped>
